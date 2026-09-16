@@ -35,14 +35,13 @@ import csv
 import copy
 import json
 import math
-import pickle  # _v2: persist fitted scalers alongside model checkpoints
 import random
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score, f1_score, average_precision_score
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
@@ -57,17 +56,6 @@ SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-# manual_seed alone does NOT guarantee determinism -- several common ops
-# (including the KMeans-based prototype clustering path, this script's core
-# mechanism) remain non-deterministic without this. v2.3 already discovered
-# and fixed this exact issue in Phase 3 (site_C/D reproducibility, same root
-# cause: KMeans clustering step) -- that fix was never ported when v2.5 was
-# forked into a separate script, so every v2.5 run this entire investigation
-# (including every result in the disentangling table) has been running
-# without it. warn_only=True rather than a hard failure, since forcing
-# strict determinism can raise on an op with no deterministic implementation
-# on some backends (e.g. MPS).
-torch.use_deterministic_algorithms(True, warn_only=True)
 
 # ── Model components ──────────────────────────────────────────────────────────
 # REAL-ARCHITECTURE VERSION: imports v2.3's actual model classes from
@@ -87,6 +75,10 @@ torch.use_deterministic_algorithms(True, warn_only=True)
 # GRLGroupDiscriminator class itself doesn't care what its n_groups
 # parameter semantically represents -- passing n_sites into it is a valid,
 # supported use of the same class, not a hack.
+# Make the shared model module importable regardless of the working
+# directory the script is launched from (it lives in this same folder).
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from fedadapt_model_approach2 import (
     SiteInputAdapter, SharedBody, GRLGroupDiscriminator, PersonalHead,
     FedAdaptClient, GradientReversalLayer,
@@ -94,256 +86,7 @@ from fedadapt_model_approach2 import (
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-# ── Feature-group taxonomy (for --discriminator_target group) ────────────────
-# Built specifically for this investigation: v2.3's GRL discriminator predicts
-# which feature GROUP (renal/inflammatory/metabolic/clinical) an embedding
-# came from; v2.5 predicts SITE identity instead. Everything else in the
-# v2.3-vs-v2.5 gap has been tested, fixed, or ruled out (see memory/runbook
-# disentangling table) -- this is the one remaining candidate, never
-# isolated as its own test because no feature-group taxonomy existed for
-# Phase 4's actual feature set (shared98_core + DX codes + expanded labs).
-# Built from two well-established, non-guessed structures:
-#   1. Standard ICD-9-CM chapter boundaries (public medical coding
-#      standard) for all dx_<code>/dx_site_<code> columns
-#   2. Standard clinical lab-panel groupings (renal panel, LFTs, CBC diff,
-#      coag, ABG, endocrine, urinalysis) for lab_site_specific columns
-# NOT independently verified against GPC's own (unrelated, Phase-3-era)
-# taxonomy -- this is a fresh, Phase-4-appropriate grouping, not a
-# reconstruction of v2.3's original renal/inflammatory/metabolic/clinical
-# labels, which were defined for a different, smaller feature set entirely.
-
-def icd9_chapter(code: str) -> str:
-    """Standard ICD-9-CM chapter for a 3-character category code (e.g. '584', 'V58', 'E93')."""
-    code = code.upper()
-    if code.startswith('V'):
-        return 'supplementary_v'
-    if code.startswith('E'):
-        return 'external_e'
-    try:
-        n = int(code)
-    except ValueError:
-        return 'other'
-    if 1 <= n <= 139:   return 'infectious'
-    if 140 <= n <= 239: return 'neoplasm'
-    if 240 <= n <= 279: return 'endocrine_metabolic'
-    if 280 <= n <= 289: return 'hematologic'
-    if 290 <= n <= 319: return 'mental'
-    if 320 <= n <= 389: return 'neuro'
-    if 390 <= n <= 459: return 'cardiovascular'
-    if 460 <= n <= 519: return 'respiratory'
-    if 520 <= n <= 579: return 'gi_hepatic'
-    if 580 <= n <= 629: return 'renal_gu'
-    if 630 <= n <= 679: return 'other'
-    if 680 <= n <= 709: return 'other'
-    if 710 <= n <= 739: return 'musculoskeletal'
-    if 740 <= n <= 779: return 'other'
-    if 780 <= n <= 799: return 'symptoms_illdefined'
-    if 800 <= n <= 999: return 'injury_poisoning'
-    return 'other'
-
-
-LAB_GROUP_KEYWORDS = {
-    'renal':               ['creatinine', 'bun', 'urine_sodium', 'urine_ph', 'urine_osmolality',
-                             'urine_specific_gravity', 'urine_protein'],
-    'cardiovascular_resp': ['sbp', 'dbp', 'oxygen_saturation', 'po2', 'pco2', 'base_excess',
-                             'co2_bldv', 'anion_gap', 'ca_i_bld'],
-    'endocrine_metabolic':  ['glucose', 'calcium', 'chloride', 'potassium', 'magnesium', 'phosphate',
-                             'bicarbonate', 'osmolality', 'tsh', 'free_t4', 'gamma_gt',
-                             'est_average_glucose'],
-    'hepatic':              ['bilirubin', 'total_protein', 'alt', 'ast', 'alkaline_phosphatase',
-                             'albumin', 'ldh'],
-    'hematologic':          ['basophils_pct', 'rdw', 'lymphocyte_pct', 'lymphocytes_nfr',
-                             'hematocrit', 'mch', 'mchc', 'mcv', 'inr', 'aptt', 'pt_bld',
-                             'eosinophil', 'neutrophil', 'neuts_seg', 'monocyte', 'myelocyte',
-                             'band_neutrophils', 'variant_lymph', 'nrbc', 'pmv', 'reticulocyte',
-                             'ferritin', 'haptoglobin', 'urate', 'imm_granulocytes'],
-    'demographic_other':    ['age_at_admission', 'gender', 'bmi', 'creatine_kinase', 'amylase',
-                             'ethanol', 'prealbumin', 'lactate'],
-}
-
-
-def assign_feature_group(colname: str) -> str:
-    """Map one feature column name to its clinical group (Phase-4-specific
-    20-group taxonomy -- used when --group_taxonomy phase4_20group)."""
-    if colname.startswith('dx_site_'):
-        return icd9_chapter(colname[len('dx_site_'):])
-    if colname.startswith('dx_'):
-        return icd9_chapter(colname[len('dx_'):])
-    base = colname.rsplit('_', 1)[0] if any(
-        colname.endswith(suf) for suf in
-        ('_most_recent', '_min', '_max', '_mean', '_hours_since')
-    ) else colname
-    for group, keywords in LAB_GROUP_KEYWORDS.items():
-        if any(kw in base for kw in keywords):
-            return group
-    return 'other'
-
-
-# ── Option A: v2.3's LITERAL original taxonomy + a new diagnostic group ──────
-# For the fair v2.3-vs-v2.5 comparison: v2.3's real FEATURE_GROUPS dict,
-# copied verbatim from fedadapt_train_approach2_v2_3.py (renal/
-# inflammatory/metabolic/hemodynamic/clinical), plus ONE new "diagnostic"
-# group covering all dx_/dx_site_ columns together (universal and
-# site-specific combined) -- Phase 3 never had ICD-9 diagnosis codes as
-# features at all, so v2.3's original taxonomy has no equivalent to drop
-# these into; a 6th group is the natural addition, not a subdivision.
-#
-# IMPORTANT, STATE THIS WHEN REPORTING RESULTS: several of v2.3's original
-# group members do not exist in Phase 4's feature set at all -- Phase 3
-# simulated continuously-monitored ICU vitals (heart_rate, spo2, resp_rate,
-# temperature, gcs_total) and coarse comorbidity flags (has_diabetes etc.)
-# that were never carried into Phase 4's canonical feature list (built
-# instead around GPC's real lab/DX feature-importance data). Under this
-# taxonomy, 'hemodynamic' and 'clinical' are consequently thin (2 members
-# each: sbp/dbp, and gender/age_at_admission) -- this is an honest
-# reflection of the real data difference between phases, not a bug. See
-# Option B (not yet implemented) for wiring in the missing columns first.
-V23_ORIGINAL_GROUPS = {
-    'renal':        ['baseline_scr', 'hours_to_anchor', 'creatinine', 'bun'],
-    'inflammatory': ['lactate', 'wbc', 'platelets'],
-    'metabolic':    ['sodium', 'potassium', 'bicarbonate',
-                      'hemoglobin', 'glucose', 'albumin', 'bilirubin'],
-    'hemodynamic':  ['sbp', 'dbp', 'heart_rate', 'spo2',
-                      'resp_rate', 'temperature', 'gcs_total'],
-    'clinical':     ['admission_type', 'gender', 'age_at_admission',
-                      'has_diabetes', 'has_hypertension', 'has_chf',
-                      'has_sepsis', 'has_liver_disease', 'has_cancer',
-                      'nephrotoxic_flag', 'nephrotoxic_count', 'n_distinct_meds'],
-}
-V23_PLUS_DX_GROUPS = ['renal', 'inflammatory', 'metabolic', 'hemodynamic',
-                       'clinical', 'diagnostic']
-V23_PLUS_DX_IDX = {g: i for i, g in enumerate(V23_PLUS_DX_GROUPS)}
-N_V23_PLUS_DX_GROUPS = len(V23_PLUS_DX_GROUPS)
-
-# Merged variant: 'hemodynamic' (sbp/dbp only, in practice) and 'clinical'
-# (gender/age_at_admission only, in practice) each populated by just 2 real
-# Phase 4 columns -- diluting the discriminator with two rarely-dominant
-# thin classes for no real benefit, given diagnostic alone has 156 columns
-# and metabolic has 4-7. Folded into one combined 'demographic_other'
-# category instead of keeping them separate. 5 groups total (coincidentally
-# the same count as v2.3's original, though composition differs).
-V23_MERGED_GROUPS = ['renal', 'inflammatory', 'metabolic', 'demographic_other', 'diagnostic']
-V23_MERGED_IDX = {g: i for i, g in enumerate(V23_MERGED_GROUPS)}
-N_V23_MERGED_GROUPS = len(V23_MERGED_GROUPS)
-
-# No-diagnostic variant: v2.3's literal 5 groups, DX columns EXCLUDED from
-# group-scoring entirely (contribute to no group's density -- same
-# treatment as any other unmatched column, e.g. heart_rate). Directly
-# isolates whether adding a diagnostic group at all was the problem, given
-# both Option A (-0.0262) and the merged variant (-0.0294) underperformed
-# the 20-group taxonomy (-0.0195) that gives diagnosis its own 16
-# ICD-9-chapter-based groups rather than one 156-column monolith. DX
-# columns remain in the model as real input FEATURES either way -- this
-# only changes what the discriminator's row-group-label is computed from.
-V23_NO_DX_GROUPS = ['renal', 'inflammatory', 'metabolic', 'hemodynamic', 'clinical']
-V23_NO_DX_IDX = {g: i for i, g in enumerate(V23_NO_DX_GROUPS)}
-N_V23_NO_DX_GROUPS = len(V23_NO_DX_GROUPS)
-
-
-def assign_feature_group_v23(colname: str) -> str:
-    """Map one feature column to v2.3's literal groups + diagnostic
-    (used when --group_taxonomy v23_original_plus_dx)."""
-    if colname.startswith('dx_site_') or colname.startswith('dx_'):
-        return 'diagnostic'
-    base = colname.rsplit('_', 1)[0] if any(
-        colname.endswith(suf) for suf in
-        ('_most_recent', '_min', '_max', '_mean', '_hours_since')
-    ) else colname
-    for group, members in V23_ORIGINAL_GROUPS.items():
-        if base in members:
-            return group
-    return None  # unmatched column contributes to no group's density score
-
-
-def assign_feature_group_v23_merged(colname: str) -> str:
-    """Same as assign_feature_group_v23, but hemodynamic and clinical are
-    folded into one 'demographic_other' category (used when
-    --group_taxonomy v23_merged_plus_dx)."""
-    raw = assign_feature_group_v23(colname)
-    if raw in ('hemodynamic', 'clinical'):
-        return 'demographic_other'
-    return raw
-
-
-def assign_feature_group_v23_no_dx(colname: str) -> str:
-    """v2.3's literal 5 groups, DX columns excluded entirely (return None,
-    same as any unmatched column -- contributes to no group's density
-    score). Used when --group_taxonomy v23_original_no_dx."""
-    if colname.startswith('dx_site_') or colname.startswith('dx_'):
-        return None
-    base = colname.rsplit('_', 1)[0] if any(
-        colname.endswith(suf) for suf in
-        ('_most_recent', '_min', '_max', '_mean', '_hours_since')
-    ) else colname
-    for group, members in V23_ORIGINAL_GROUPS.items():
-        if base in members:
-            return group
-    return None
-    return raw
-
-
-
-# Fixed, global group vocabulary -- MUST be the same ordering at every site,
-# or the shared discriminator's group index 0 would mean a different
-# clinical group at different sites, silently corrupting what it's
-# learning. Covers every possible output of icd9_chapter() plus every key
-# in LAB_GROUP_KEYWORDS.
-GLOBAL_GROUPS = [
-    'infectious', 'neoplasm', 'endocrine_metabolic', 'hematologic', 'mental',
-    'neuro', 'cardiovascular', 'respiratory', 'gi_hepatic', 'renal_gu',
-    'musculoskeletal', 'symptoms_illdefined', 'injury_poisoning',
-    'supplementary_v', 'external_e', 'other',
-    'renal', 'cardiovascular_resp', 'hepatic', 'demographic_other',
-]
-GLOBAL_GROUP_IDX = {g: i for i, g in enumerate(GLOBAL_GROUPS)}
-N_GLOBAL_GROUPS = len(GLOBAL_GROUPS)
-
-
-def build_row_group_labels(X_df: pd.DataFrame, feat_cols: list, taxonomy: str = "phase4_20group") -> np.ndarray:
-    """
-    Dominant-group-per-row assignment, matching v2.3's _assign_group_labels
-    logic: for each row, the group whose columns have the highest non-zero
-    density wins. Uses a FIXED vocabulary (not a per-site derived one) so
-    group index 0 means the same clinical group at every site -- required
-    for the shared discriminator to learn anything coherent across sites.
-
-    taxonomy: "phase4_20group" (default, ICD-9-chapter + lab-panel based,
-        sized for Phase 4's actual feature set) or "v23_original_plus_dx"
-        (v2.3's literal 5 groups + a new diagnostic group -- for the fair
-        v2.3-vs-v2.5 comparison; several original members are absent from
-        Phase 4's data, see V23_ORIGINAL_GROUPS docstring above).
-    """
-    if taxonomy == "v23_original_plus_dx":
-        assign_fn = assign_feature_group_v23
-        group_idx = V23_PLUS_DX_IDX
-        n_groups = N_V23_PLUS_DX_GROUPS
-    elif taxonomy == "v23_merged_plus_dx":
-        assign_fn = assign_feature_group_v23_merged
-        group_idx = V23_MERGED_IDX
-        n_groups = N_V23_MERGED_GROUPS
-    elif taxonomy == "v23_original_no_dx":
-        assign_fn = assign_feature_group_v23_no_dx
-        group_idx = V23_NO_DX_IDX
-        n_groups = N_V23_NO_DX_GROUPS
-    else:
-        assign_fn = assign_feature_group
-        group_idx = GLOBAL_GROUP_IDX
-        n_groups = N_GLOBAL_GROUPS
-
-    col_to_group = {c: assign_fn(c) for c in feat_cols}
-
-    group_scores = np.zeros((len(X_df), n_groups))
-    for g, g_i in group_idx.items():
-        cols_in_group = [c for c in feat_cols if col_to_group[c] == g]
-        if not cols_in_group:
-            continue
-        sub = X_df[cols_in_group].fillna(0)
-        group_scores[:, g_i] = (sub != 0).mean(axis=1).values
-
-    return group_scores.argmax(axis=1), n_groups
-
-
-def load_site(path, label_col=None, batch_size=256, test_frac=0.2, group_taxonomy="phase4_20group"):
+def load_site(path, label_col=None, batch_size=256, test_frac=0.2):
     df = pd.read_csv(path)
 
     # Step 1: find label column — must contain 'aki', be numeric, binary {0,1}
@@ -365,24 +108,6 @@ def load_site(path, label_col=None, batch_size=256, test_frac=0.2, group_taxonom
     non_numeric = [c for c in df.columns
                    if not pd.api.types.is_numeric_dtype(df[c])]
     exclude = {label_col} | set(non_numeric)
-
-    # GPC-unavailable vitals exclusion (Aug 2026): matches the same fix applied
-    # to the v2.3 training script (fedadapt_train_approach2_v2_3_..._leakage_fixed.py).
-    # Zijian confirmed real GPC sites only expose AGE, SBP, DBP, BMI as continuous
-    # vitals/demographics -- heart_rate, resp_rate, temperature, spo2,
-    # oxygen_saturation, gcs_total have no counterpart in real GPC production
-    # tables. This script's original feat_cols (all-numeric-except-label) had
-    # no such exclusion at all, unlike v2.3's script -- added here so v2.5 runs
-    # are on the same feature space as v2.3/native runs and results are
-    # comparable rather than confounded by a feature-set difference.
-    GPC_UNAVAILABLE_VITALS = {
-        f"{base}_{stat}"
-        for base in ("heart_rate", "resp_rate", "temperature",
-                     "spo2", "oxygen_saturation", "gcs_total")
-        for stat in ("min", "max", "mean", "most_recent")
-    }
-    exclude |= GPC_UNAVAILABLE_VITALS
-
     feat_cols = [c for c in df.columns if c not in exclude]
     X_df = df[feat_cols].copy()
 
@@ -398,11 +123,6 @@ def load_site(path, label_col=None, batch_size=256, test_frac=0.2, group_taxonom
     X = X_df.values.astype(np.float32)
     y = df[label_col].values.astype(np.float32)
 
-    # Group labels for --discriminator_target group (computed regardless of
-    # which target is actually used, since it's cheap and keeps load_site's
-    # return signature simple)
-    g_labels, n_groups_found = build_row_group_labels(X_df, feat_cols, taxonomy=group_taxonomy)
-
     n = len(X)
     idx = np.random.permutation(n)
     split = int(n * (1 - test_frac))
@@ -413,60 +133,14 @@ def load_site(path, label_col=None, batch_size=256, test_frac=0.2, group_taxonom
     X_tr = scaler.fit_transform(X[tr])
     X_te = scaler.transform(X[te])
 
-    tr_ds = TensorDataset(torch.tensor(X_tr), torch.tensor(y[tr]), torch.tensor(g_labels[tr], dtype=torch.long))
-    te_ds = TensorDataset(torch.tensor(X_te), torch.tensor(y[te]), torch.tensor(g_labels[te], dtype=torch.long))
+    tr_ds = TensorDataset(torch.tensor(X_tr), torch.tensor(y[tr]))
+    te_ds = TensorDataset(torch.tensor(X_te), torch.tensor(y[te]))
 
-    # Class-weighted sampler for imbalanced sites -- ported from v2.3, which
-    # has always had this and v2.5 never did. Separate from pos_weight (which
-    # only reweights the loss): this actually oversamples AKI-positive rows
-    # so each training batch is roughly 50/50, regardless of the site's true
-    # 9.99%-15.8% prevalence. A real, previously-uninvestigated candidate for
-    # the residual v2.3-vs-v2.5 gap found after architecture, prototype
-    # aggregation, discriminator taxonomy+weighting, and local_epochs were
-    # all matched and a gap still remained.
-    y_tr_tensor = torch.tensor(y[tr])
-    if y_tr_tensor.sum() > 0:
-        n_pos = y_tr_tensor.sum().item()
-        n_neg = len(y_tr_tensor) - n_pos
-        w_pos = len(y_tr_tensor) / (2 * n_pos)
-        w_neg = len(y_tr_tensor) / (2 * n_neg)
-        sample_weights = torch.where(y_tr_tensor == 1,
-                                      torch.tensor(w_pos), torch.tensor(w_neg))
-        sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
-        tr_ld = DataLoader(tr_ds, batch_size=batch_size, sampler=sampler, drop_last=True)
-    else:
-        tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, drop_last=True)
+    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True,  drop_last=True)
     te_ld = DataLoader(te_ds, batch_size=batch_size, shuffle=False, drop_last=False)
 
-    # Inverse-frequency class weights for the discriminator's loss, computed
-    # from the TRAINING split's actual group-label distribution (matches how
-    # pos_weight is computed below, from the training labels only -- no test
-    # leakage). Addresses the imbalance mechanism directly: a group's ROW
-    # ASSIGNMENT frequency is what actually matters (driven by diagnostic's
-    # column count dominating the argmax for most rows), not the taxonomy's
-    # group COUNT -- sklearn-style balanced weighting:
-    #   weight[c] = n_samples / (n_classes * count[c])
-    # Groups with zero rows assigned (can happen for a site missing certain
-    # columns entirely) get weight 0 -- CrossEntropyLoss never sees that
-    # class as a target for this site anyway, so this is just a safe default
-    # rather than a divide-by-zero.
-    g_tr = g_labels[tr]
-    class_counts = np.bincount(g_tr, minlength=n_groups_found)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        group_class_weights = np.where(
-            class_counts > 0,
-            len(g_tr) / (n_groups_found * np.maximum(class_counts, 1)),
-            0.0,
-        )
-    group_class_weights = torch.tensor(group_class_weights, dtype=torch.float32)
-
     prevalence = float(y.mean())
-    # scaler added (_v2): the fitted StandardScaler must be persisted
-    # alongside the model -- a predict_fn built later against this site's
-    # model needs the SAME fitted scaler, not a refit one, or feature-group
-    # permutation-importance results would silently conflate a
-    # distribution shift with the group-dropout effect being measured.
-    return tr_ld, te_ld, X.shape[1], prevalence, feat_cols, n_groups_found, group_class_weights, scaler
+    return tr_ld, te_ld, X.shape[1], prevalence, feat_cols
 
 
 # ── Prototype helpers ─────────────────────────────────────────────────────────
@@ -576,7 +250,7 @@ def extract_embeddings(client, loader, device):
     client.eval()
     embs, labs = [], []
     with torch.no_grad():
-        for xb, yb, _ in loader:
+        for xb, yb in loader:
             xb = xb.to(device)
             if xb.shape[0] < 2:   # skip single-sample batches (BatchNorm)
                 continue
@@ -600,7 +274,7 @@ def warm_embeddings(client, loader, optimizer, device, n_epochs=5):
     criterion = nn.BCEWithLogitsLoss()
     client.train()
     for _ in range(n_epochs):
-        for xb, yb, _ in loader:
+        for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
             out, _ = client(xb)
@@ -659,7 +333,7 @@ def evaluate(client, loader, device):
     client.eval()
     preds, trues = [], []
     with torch.no_grad():
-        for xb, yb, _ in loader:
+        for xb, yb in loader:
             xb = xb.to(device)
             out, _ = client(xb)
             preds.append(torch.sigmoid(out).cpu().numpy())
@@ -706,8 +380,7 @@ def warmup_scale(current_round, warmup_rounds):
 def local_train(client, loader, optimizer, device, site_idx,
                 n_sites, lam_adv, alpha_proto, global_protos, n_clusters,
                 local_epochs=5, pos_weight=None,
-                main_grad_clip=5.0, progress=0.0, discriminator_target="site",
-                group_class_weights=None):
+                main_grad_clip=5.0, progress=0.0):
     """
     REAL-ARCHITECTURE VERSION. v2.3's client has no per-call `lam` argument
     on forward() -- the GRL's own internal two-phase schedule is driven by
@@ -722,19 +395,6 @@ def local_train(client, loader, optimizer, device, site_idx,
     No freeze_head parameter: v2.3 trains ALL parameters jointly during
     federation (optimizer scope is client.parameters() in the caller) --
     head-freezing only happens in the post-federation fine-tune step.
-
-    discriminator_target: "site" (v2.5 original -- fixed site-identity
-    label, one per batch) or "group" (v2.3-style -- per-ROW feature-group
-    label, from the taxonomy built for this test). Client's discriminator
-    output dim must match n_sites or n_groups accordingly at construction.
-
-    group_class_weights: optional per-class weight tensor for the
-    discriminator's CrossEntropyLoss (--group_class_weighting), computed
-    from that site's training-split group-label frequency (inverse
-    frequency, sklearn-balanced-style). Addresses row-assignment imbalance
-    directly (e.g. diagnostic dominating the argmax for most rows) rather
-    than restructuring the taxonomy itself. Ignored when discriminator_target
-    is "site".
     """
     _dev = next(client.parameters()).device
     if pos_weight is not None:
@@ -742,18 +402,15 @@ def local_train(client, loader, optimizer, device, site_idx,
         criterion = nn.BCEWithLogitsLoss(pos_weight=_pw_tensor)
     else:
         criterion = nn.BCEWithLogitsLoss()
-    if discriminator_target == "group" and group_class_weights is not None:
-        adv_crit = nn.CrossEntropyLoss(weight=group_class_weights.to(_dev))
-    else:
-        adv_crit = nn.CrossEntropyLoss()
+    adv_crit = nn.CrossEntropyLoss()
     client.train()
     client.set_training_progress(progress)
     total_adv_loss = 0.0
     site_label_tensor = torch.tensor(site_idx, dtype=torch.long)
 
     for _ in range(local_epochs):
-        for xb, yb, gb in loader:
-            xb, yb, gb = xb.to(device), yb.to(device), gb.to(device)
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
 
             out, adv_logits, h = client.forward_with_embedding(xb)
@@ -766,14 +423,11 @@ def local_train(client, loader, optimizer, device, site_idx,
             # Classification loss
             cls_loss = criterion(out, yb)
 
-            # Adversarial loss -- target is either fixed site-identity
-            # (v2.5 original) or per-row feature-group (v2.3-style, this
-            # test's variable)
-            if discriminator_target == "group":
-                adv_labels = gb
-            else:
-                adv_labels = site_label_tensor.expand(xb.size(0)).to(device)
-            adv_loss = adv_crit(adv_logits, adv_labels)
+            # Adversarial loss (target stays site-identity, see scoping
+            # note at the top of the file -- not v2.3's feature-group
+            # taxonomy, which has no Phase 4 equivalent)
+            site_labels = site_label_tensor.expand(xb.size(0)).to(device)
+            adv_loss = adv_crit(adv_logits, site_labels)
 
             # Prototype alignment loss
             proto_loss = torch.tensor(0.0, device=device)
@@ -908,14 +562,18 @@ def compute_or_load_shared_local_baseline(
 
     Returns (local_aurocs: {site_id: mean_auroc}, cache_df: pd.DataFrame).
     """
-    # [FIX] Same issue as the archetype (Phase 1) script: this cache
-    # previously lived at a single, condition-independent path despite
-    # the docstring's claim of being "keyed by alpha/gamma condition" --
-    # it was not. Parsing the condition directly from site_files (already
-    # filtered to just this condition's real files) and baking it into
-    # the cache filename means each (alpha, gamma) gets its own cache and
-    # can never collide with another condition's, even when all
-    # conditions' data lives in the same flat data_dir.
+    # [FIX] This cache previously lived at a single, condition-independent
+    # path (data_dir/local_baseline_fl_gain_revised.csv) despite the
+    # docstring's claim that it's "keyed by alpha/gamma condition" -- it
+    # was not. Since the disjoint-sites data generator writes every
+    # condition into the same flat data_dir, this meant every run (after
+    # the very first) loaded a STALE cache computed for a DIFFERENT
+    # condition entirely -- or, before the site_files filtering fix above,
+    # a cache polluted with all ~100 (site x condition) combinations from
+    # the original bug. The condition is now parsed directly from
+    # site_files (already filtered to just this condition's 5 real files)
+    # and baked into the cache filename, so each (alpha, gamma) gets its
+    # own cache and can never collide with another condition's.
     _cond_match = re.search(r"_alpha([\d.]+)_gamma([\d.]+)\.csv$", site_files[0]) if site_files else None
     if _cond_match:
         _cond_suffix = f"_alpha{_cond_match.group(1)}_gamma{_cond_match.group(2)}"
@@ -955,7 +613,7 @@ def compute_or_load_shared_local_baseline(
             np.random.seed(bseed)
             torch.manual_seed(bseed)
 
-            tr_ld, te_ld, in_dim, _, _, _, _, _ = load_site(path, batch_size=batch_size)
+            tr_ld, te_ld, in_dim, _, _ = load_site(path, batch_size=batch_size)
 
             bc = nn.Sequential(
                 nn.Linear(in_dim, hidden_dim),
@@ -968,7 +626,7 @@ def compute_or_load_shared_local_baseline(
             bopt = optim.Adam(bc.parameters(), lr=lr)
             bc.train()
             for _ in range(epochs):
-                for xb, yb, _ in tr_ld:
+                for xb, yb in tr_ld:
                     xb, yb = xb.to(device), yb.to(device)
                     bopt.zero_grad()
                     out = bc(xb).squeeze(-1)
@@ -980,7 +638,7 @@ def compute_or_load_shared_local_baseline(
             bc.eval()
             preds_b, trues_b = [], []
             with torch.no_grad():
-                for xb, yb, _ in te_ld:
+                for xb, yb in te_ld:
                     xb = xb.to(device)
                     out = bc(xb).squeeze(-1)
                     preds_b.append(torch.sigmoid(out).cpu().numpy())
@@ -1050,58 +708,61 @@ def run_fedadaptproto(args, data_dir, output_dir):
 
     # ── Load data ──────────────────────────────────────────────────────────────
     print("Loading site data...")
-    # Bug fix (Aug 2026): previously matched ANY "sim_*.csv" file in data_dir
-    # with no alpha/gamma filtering at all -- args.alpha/args.gamma were never
-    # referenced anywhere in this function. With all 3 conditions' CSVs sitting
-    # in the same phase4_data/ directory (18 files = 6 sites x 3 conditions),
-    # this silently pooled ALL 18 as separate federated clients in one
-    # 18-site mega-federation, on every run, regardless of which --alpha/
-    # --gamma was requested on the command line. Confirmed by site_id values
-    # like "sim_KUMC_alpha0.0_gamma0.0" appearing as distinct clients even in
-    # a run launched with --alpha 0.5 --gamma 0.75. Fixed to match the exact
-    # requested condition first (same pattern as v2.3's load_all_sites), with
-    # a legacy fallback (unsuffixed site_*.csv / sim_*.csv, no alpha/gamma in
-    # the filename) for the Phase 3 archetype cohort, which predates the
-    # alpha/gamma-suffixed naming convention entirely.
-    all_csvs = [f for f in os.listdir(data_dir)
-                if f.endswith(".csv") and "fl_gain_index" not in f]
-
-    cond_suffix = f"_alpha{args.alpha}_gamma{args.gamma}.csv"
-    site_files = sorted([f for f in all_csvs
-                          if f.startswith("sim_") and f.endswith(cond_suffix)])
-
+    # [FIX] The original filter below matched every site_*/sim_* CSV in
+    # data_dir regardless of alpha/gamma. That's harmless when data_dir
+    # contains only one condition's files, but the disjoint-sites
+    # simulation script writes ALL conditions into the same flat
+    # directory (site_A_alpha0.1_gamma0.0.csv, site_A_alpha0.3_gamma0.75.csv,
+    # ... all together) -- so this was silently loading every condition's
+    # data as if each (site, alpha, gamma) combination were its own
+    # separate site, training a ~100-site federation instead of the
+    # intended 5, for every single grid job regardless of which specific
+    # alpha/gamma it was told to run. Now filters to exactly the
+    # requested condition first, matching how the v2.3 script
+    # (fedadapt_train_approach2_v2_3_phase1_archetype_post_leakage.py)
+    # already does this correctly.
+    suffix = f"_alpha{args.alpha}_gamma{args.gamma}.csv"
+    site_files = sorted([
+        f for f in os.listdir(data_dir)
+        if f.endswith(suffix) and "fl_gain_index" not in f
+        and (f.startswith("site_") or f.startswith("sim_"))
+        # site_* = Phase 3 archetype naming (site_A.csv, ...)
+        # sim_*  = Phase 4 real-GPC-site naming (sim_KUMC_alpha0.5_gamma0.75.csv, ...)
+        # Original code only matched site_*, which silently produced an
+        # empty site list (and a downstream max()-of-empty-sequence crash
+        # in compute_fl_gain) on any Phase 4 data directory.
+    ])
     if not site_files:
-        # Legacy fallback: Phase 3 archetype cohort (site_A.csv, ... -- no
-        # alpha/gamma in the filename at all) or a data_dir that genuinely
-        # only has one condition's files without the suffix.
-        site_files = sorted([f for f in all_csvs
-                              if f.startswith("site_") or f.startswith("sim_")])
+        # Fallback: no alpha/gamma-suffixed files found (e.g. data_dir
+        # holds unsuffixed site_A.csv-style files for a single condition
+        # already separated into its own directory). Falls back to the
+        # original, unfiltered behavior in that case only.
+        site_files = sorted([
+            f for f in os.listdir(data_dir)
+            if f.endswith(".csv") and "fl_gain_index" not in f
+            and (f.startswith("site_") or f.startswith("sim_"))
+        ])
         if site_files:
-            print(f"  [WARNING] No files matched suffix '{cond_suffix}' -- "
-                  f"falling back to ALL {len(site_files)} sim_*/site_*.csv "
-                  f"files in {data_dir}. If this data_dir has multiple "
-                  f"conditions' CSVs, this will silently pool them as "
-                  f"separate clients again. Verify site_ids below are what "
-                  f"you expect before trusting this run.")
-
-    site_ids = [os.path.splitext(f)[0] for f in site_files]   # e.g. ["site_A", ...]
+            print(f"  [warning] no files matched suffix '{suffix}'; falling back to "
+                  f"all {len(site_files)} site_*/sim_* CSVs in {data_dir}. If this "
+                  f"directory holds more than one condition's data, this will "
+                  f"incorrectly merge them into one run -- verify data_dir contains "
+                  f"only the intended condition, or that filenames carry the "
+                  f"expected alpha/gamma suffix.")
+    site_ids = [os.path.splitext(f)[0] for f in site_files]   # e.g. ["site_A_alpha0.1_gamma0.0", ...]
 
     loaders_tr, loaders_te = {}, {}
     input_dims, prevalences, feat_cols_map = {}, {}, {}
-    group_weights_map = {}
-    scalers_map = {}  # _v2: fitted per-site StandardScaler, persisted at save time below
     site_stats = {}
 
     for sid, fname in zip(site_ids, site_files):
         path = os.path.join(data_dir, fname)
-        tr_ld, te_ld, in_dim, prev, fcols, _, gweights, site_scaler = load_site(path, batch_size=args.batch_size, group_taxonomy=args.group_taxonomy)
+        tr_ld, te_ld, in_dim, prev, fcols = load_site(path, batch_size=args.batch_size)
         loaders_tr[sid]  = tr_ld
         loaders_te[sid]  = te_ld
         input_dims[sid]  = in_dim
         prevalences[sid] = prev
         feat_cols_map[sid] = fcols
-        group_weights_map[sid] = gweights
-        scalers_map[sid] = site_scaler
 
         n_total = len(tr_ld.dataset) + len(te_ld.dataset)
         n_aki   = int(round(prev * n_total))
@@ -1138,23 +799,12 @@ def run_fedadaptproto(args, data_dir, output_dir):
     for sid in site_ids:
         scale = min(1.0, prevalences[sid] / PREVALENCE_REF)
         lam = args.lambda_adv * scale
-        if args.discriminator_target == "group":
-            if args.group_taxonomy == "v23_original_plus_dx":
-                discriminator_out_dim = N_V23_PLUS_DX_GROUPS
-            elif args.group_taxonomy == "v23_merged_plus_dx":
-                discriminator_out_dim = N_V23_MERGED_GROUPS
-            elif args.group_taxonomy == "v23_original_no_dx":
-                discriminator_out_dim = N_V23_NO_DX_GROUPS
-            else:
-                discriminator_out_dim = N_GLOBAL_GROUPS
-        else:
-            discriminator_out_dim = n_sites
         model = FedAdaptClient(
             site_id=sid,
             input_dim=input_dims[sid],
             embedding_dim=args.embedding_dim,
             hidden_dim=args.hidden_dim,
-            n_groups=discriminator_out_dim,   # site-identity (n_sites) or feature-group (N_GLOBAL_GROUPS), per --discriminator_target
+            n_groups=n_sites,   # scoping decision: site-identity target, see file header
             grl_lambda_max=lam,
             dropout=0.1,
             aki_prevalence=prevalences[sid],
@@ -1163,7 +813,7 @@ def run_fedadaptproto(args, data_dir, output_dir):
         optimizers[sid] = optim.Adam(model.parameters(), lr=args.lr)
         print(f"  [model] {sid}: input_dim={input_dims[sid]-1}  "
               f"→ embedding_dim={args.embedding_dim}  hidden={args.hidden_dim}  "
-              f"lambda_adv={lam:.3f}  discriminator_target={args.discriminator_target} (out_dim={discriminator_out_dim})")
+              f"lambda_adv={lam:.3f}")
 
     # ── Local-only baseline (shared, cached, multi-seed) ───────────────────────
     print("Loading/computing shared local-only baseline...")
@@ -1226,14 +876,12 @@ def run_fedadaptproto(args, data_dir, output_dir):
         _global_protos_pre = {}
         _n_clusters_pre = {sid: args.k_min for sid in site_ids}
         # [bestckpt_fix] Phase 1 previously had no best-checkpoint tracking --
-        # unlike Phase 2 (see best_auroc/best_round below), which restores
-        # each site to its own peak-AUROC round before finishing. Phase 1's
-        # own AUROC peaks early then declines for the rest of its rounds
-        # (confirmed via console logs on the archetype cohort), and that
-        # already-degraded end-of-Phase-1 state was what got handed to
-        # Phase 2. Added here to match the pattern already proven in
-        # Phase 2/v2.3, and to test whether it explains part of this
-        # cohort's confirmed v2.5 net-negative result too.
+        # unlike Phase 2 and v2.3, which both restore each site to its own
+        # peak-AUROC round before continuing. Phase 1's own AUROC peaks
+        # early (~round 10) then declines for the rest of its 50 rounds
+        # (confirmed from console logs), and that already-degraded
+        # end-of-Phase-1 state was what got handed to Phase 2. Added here
+        # to match the pattern already proven in Phase 2/v2.3.
         _p1_best_auroc = {sid: -1.0 for sid in site_ids}
         _p1_best_round = {sid: 0 for sid in site_ids}
         _p1_best_state = {sid: None for sid in site_ids}
@@ -1255,10 +903,7 @@ def run_fedadaptproto(args, data_dir, output_dir):
                                      _n_clusters_pre[sid], args.local_epochs,
                                      pos_weight=_pw,
                                      main_grad_clip=args.main_grad_clip,
-                                     progress=_progress,
-                                     discriminator_target=args.discriminator_target,
-                                     group_class_weights=(group_weights_map.get(sid)
-                                         if args.group_class_weighting else None))
+                                     progress=_progress)
                 _all_pre[sid] = _lp
             fedavg_bodies(clients, weights)
             _global_protos_pre = average_prototypes(_all_pre, fl_gain_weights=fl_gain)
@@ -1304,7 +949,7 @@ def run_fedadaptproto(args, data_dir, output_dir):
             _ft_opt = optim.Adam(clients[sid].head.parameters(), lr=args.lr * 0.1)
             clients[sid].train()
             for _ in range(30):   # full fine-tuning protocol — matches phase 2
-                for xb, yb, _ in loaders_tr[sid]:
+                for xb, yb in loaders_tr[sid]:
                     xb, yb = xb.to(device), yb.to(device)
                     _ft_opt.zero_grad()
                     out, _ = clients[sid](xb)
@@ -1371,11 +1016,28 @@ def run_fedadaptproto(args, data_dir, output_dir):
                     nn.init.xavier_uniform_(m.weight)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
-            # Rebuild optimizer to include all parameters (head now trainable)
-            for p in clients[sid].parameters():
-                p.requires_grad_(True)
-            optimizers[sid] = optim.Adam(clients[sid].parameters(), lr=args.lr)
-        print("  [auto-K] Phase 2 clients ready — all parameters trainable.")
+            if args.head_fix_rounds > 0:
+                # [head_fix test] Freeze body/adapter/discriminator; only the
+                # freshly-reset head is trainable for the first
+                # head_fix_rounds of Phase 2. Guards the already-trained
+                # body against large early gradients from the random head
+                # before joint training resumes.
+                for p in clients[sid].body.parameters():          p.requires_grad_(False)
+                for p in clients[sid].adapter.parameters():       p.requires_grad_(False)
+                for p in clients[sid].discriminator.parameters(): p.requires_grad_(False)
+                for p in clients[sid].head.parameters():          p.requires_grad_(True)
+                optimizers[sid] = optim.Adam(clients[sid].head.parameters(), lr=args.lr)
+            else:
+                # Original behavior: rebuild optimizer to include all
+                # parameters (head now trainable) from round 1 of Phase 2.
+                for p in clients[sid].parameters():
+                    p.requires_grad_(True)
+                optimizers[sid] = optim.Adam(clients[sid].parameters(), lr=args.lr)
+        if args.head_fix_rounds > 0:
+            print(f"  [head_fix] Phase 2 clients ready — body/adapter/discriminator "
+                  f"FROZEN for the first {args.head_fix_rounds} rounds; head only.")
+        else:
+            print("  [auto-K] Phase 2 clients ready — all parameters trainable.")
 
         # Save report
         report_path = os.path.join(output_dir, "auto_k_report.csv")
@@ -1396,6 +1058,11 @@ def run_fedadaptproto(args, data_dir, output_dir):
         # Uniform K fallback
         n_clusters_per_site = {sid: args.n_clusters for sid in site_ids}
         print(f"  [uniform K={args.n_clusters}] applied to all sites")
+
+    # [head_fix test] Only relevant for post-auto-K Phase 2 with
+    # --head_fix_rounds > 0; never true for manual-K or uniform-K runs,
+    # which never freeze anything to begin with.
+    head_fix_active = bool(args.auto_k and not manual_k and args.head_fix_rounds > 0)
 
     print(f"  [per-site K] {n_clusters_per_site}")
 
@@ -1421,6 +1088,20 @@ def run_fedadaptproto(args, data_dir, output_dir):
     best_state = {sid: None for sid in site_ids}
 
     for rnd in range(1, args.n_rounds + 1):
+        if head_fix_active and rnd == args.head_fix_rounds + 1:
+            # [head_fix test] Head-only warmup within Phase 2 is complete --
+            # unfreeze body/adapter/discriminator and rebuild the optimizer
+            # to include all parameters, resuming joint training exactly as
+            # the original (head_fix_rounds=0) code path does from round 1.
+            print(f"  [head_fix] Round {rnd}: head-only warmup complete "
+                  f"({args.head_fix_rounds} rounds) -- unfreezing body/"
+                  f"adapter/discriminator, resuming joint training.")
+            for sid in site_ids:
+                for p in clients[sid].parameters():
+                    p.requires_grad_(True)
+                optimizers[sid] = optim.Adam(clients[sid].parameters(), lr=args.lr)
+            head_fix_active = False  # only fires once
+
         scale = warmup_scale(rnd, args.warmup_rounds)
         progress = rnd / args.n_rounds   # drives GRL's internal 2-phase schedule (v2.3-real)
         all_site_protos = {}
@@ -1459,9 +1140,6 @@ def run_fedadaptproto(args, data_dir, output_dir):
                 pos_weight=_pw,
                 main_grad_clip=args.main_grad_clip,
                 progress=progress,
-                discriminator_target=args.discriminator_target,
-                group_class_weights=(group_weights_map.get(sid)
-                    if args.group_class_weighting else None),
             )
             all_site_protos[sid] = local_protos
 
@@ -1515,7 +1193,7 @@ def run_fedadaptproto(args, data_dir, output_dir):
             criterion = nn.BCEWithLogitsLoss()
         clients[sid].train()
         for _ in range(args.ft_epochs):
-            for xb, yb, _ in loaders_tr[sid]:
+            for xb, yb in loaders_tr[sid]:
                 xb, yb = xb.to(device), yb.to(device)
                 head_opt.zero_grad()
                 out, _ = clients[sid](xb)
@@ -1578,22 +1256,6 @@ def run_fedadaptproto(args, data_dir, output_dir):
         for r in results:
             w.writerow([r["site_id"], r["fl_gain_index"], r["fl_gain_revised"],
                         r["local_auroc"], r["delta_auroc"], r["selected_k"]])
-
-    # ── Save models + scalers (_v2 addition) ────────────────────────────────────
-    # v2.5 previously saved NEITHER model weights nor the fitted scaler to
-    # disk -- best_state[sid] tracked in local_train's checkpoint loop above
-    # only ever lived in memory and was discarded when the process exited.
-    # This saves the FINAL client state (post head-fine-tuning, i.e. what
-    # clients[sid] holds right here) plus the exact fitted scaler each site
-    # used, so a predict_fn can be reconstructed later without refitting
-    # anything against different data.
-    print("  Saving models + scalers...")
-    for sid in site_ids:
-        torch.save(clients[sid].state_dict(), os.path.join(output_dir, f"{sid}_model.pt"))
-        with open(os.path.join(output_dir, f"{sid}_scaler.pkl"), "wb") as f:
-            pickle.dump(scalers_map[sid], f)
-        with open(os.path.join(output_dir, f"{sid}_feat_cols.json"), "w") as f:
-            json.dump(feat_cols_map[sid], f)
 
     # ── Plots ──────────────────────────────────────────────────────────────────
     print("  Generating plots...")
@@ -1814,56 +1476,18 @@ def parse_args():
                         "main federated training (default 5.0 = v2.5 "
                         "original; v2.3 uses 1.0, 5x tighter, in both its "
                         "fedadapt and fedadaptproto local-step functions)")
-    p.add_argument("--discriminator_target", type=str, default="site",
-                   choices=["site", "group"],
-                   help="What the GRL discriminator predicts. 'site' (default) "
-                        "= fixed site-identity label, one per batch (v2.5 "
-                        "original). 'group' = per-row feature-group label "
-                        "(v2.3-style) -- which taxonomy is used is controlled "
-                        "by --group_taxonomy below. Only relevant when this "
-                        "is 'group'.")
-    p.add_argument("--group_taxonomy", type=str, default="phase4_20group",
-                   choices=["phase4_20group", "v23_original_plus_dx", "v23_merged_plus_dx", "v23_original_no_dx"],
-                   help="Which group vocabulary --discriminator_target group "
-                        "uses. 'v23_merged_plus_dx' = same as "
-                        "v23_original_plus_dx but hemodynamic (sbp/dbp only, "
-                        "in practice) and clinical (gender/age_at_admission "
-                        "only, in practice) folded into one "
-                        "'demographic_other' category, since both are "
-                        "thin/rarely-dominant classes on Phase 4 data -- 5 "
-                        "groups total. 'phase4_20group' (default) = a NEW taxonomy "
-                        "built from standard ICD-9 chapters + clinical "
-                        "lab-panel groupings, sized for Phase 4's actual "
-                        "228-358-feature data -- NOT a reconstruction of "
-                        "v2.3's original groups. 'v23_original_plus_dx' = "
-                        "v2.3's LITERAL 5 groups (renal/inflammatory/"
-                        "metabolic/hemodynamic/clinical), copied verbatim, "
-                        "plus one new diagnostic group for the DX columns "
-                        "Phase 3 never had -- for the fair v2.3-vs-v2.5 "
-                        "comparison. WARNING: several of v2.3's original "
-                        "group members (ICU vitals, comorbidity flags) don't "
-                        "exist in Phase 4's data, so 'hemodynamic' and "
-                        "'clinical' come out thin (2 members each) under "
-                        "this option -- an honest reflection of the real "
-                        "data difference between phases, not a bug. See "
-                        "V23_ORIGINAL_GROUPS docstring for the full list.")
-    p.add_argument("--group_class_weighting", action="store_true", default=False,
-                   help="Apply inverse-frequency class weighting to the "
-                        "discriminator's CrossEntropyLoss (--discriminator_target "
-                        "group only), computed per-site from that site's "
-                        "training-split group-label distribution "
-                        "(sklearn-balanced-style: weight[c] = n / (n_classes * "
-                        "count[c])). Addresses the actual row-ASSIGNMENT "
-                        "imbalance directly -- e.g. diagnostic dominating the "
-                        "argmax for most rows given its 156-column size -- "
-                        "rather than restructuring the taxonomy itself (contrast "
-                        "with v23_merged_plus_dx / v23_original_no_dx, which "
-                        "changed which groups exist). Default: off, matching "
-                        "every prior group-discriminator result in this "
-                        "investigation -- turn on to test this as an additive, "
-                        "single-variable change on top of whichever "
-                        "--group_taxonomy is selected.")
     p.add_argument("--warmup_rounds",      type=int,   default=10)
+    p.add_argument("--head_fix_rounds", type=int, default=0,
+                   help="[head_fix test] Number of rounds at the START of "
+                        "Phase 2 (post-auto-K reset) during which body/"
+                        "adapter/discriminator are FROZEN and only the "
+                        "freshly-reset head trains, before everything is "
+                        "unfrozen for the remainder of Phase 2. Tests "
+                        "whether Phase 2's immediate full-model gradient "
+                        "flow from a random head is disrupting the "
+                        "already-trained Phase 1 body ('gradient shock'). "
+                        "0 (default) = original behavior, everything "
+                        "trainable from round 1 of Phase 2, unchanged.")
     p.add_argument("--early_stop_patience",type=int,   default=0)
 
     # K configuration — three mutually exclusive modes:
@@ -1905,7 +1529,6 @@ def main():
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
-    torch.use_deterministic_algorithms(True, warn_only=True)  # see module-level comment above
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 

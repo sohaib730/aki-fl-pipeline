@@ -14,10 +14,15 @@
 
 set -e
 
+# Always run from the repository root, whatever directory this script is
+# invoked from -- data/results paths below are relative to the repo root and
+# the Python files live in simulation/ and training/.
+cd "$(dirname "$0")/.."
+
 PHASE1_CSV="aki_anchor_based_24h_lookback.csv"
 PHASE2_CSV="aki_anchor_based_24h_lookback_aligned_features.csv"
-PHASE1_SCRIPT="phase1_archetype_simulation.py"
-PHASE2_SCRIPT="phase2_gpc_aligned_simulation.py"
+PHASE1_SCRIPT="simulation/phase1_archetype_simulation.py"
+PHASE2_SCRIPT="simulation/phase2_gpc_aligned_simulation.py"
 
 # =========================================================================
 # STEP 1 — single-condition smoke test (fast; confirms no shortfall/
@@ -37,8 +42,8 @@ python3 "$PHASE2_SCRIPT" \
 
 echo
 echo "=== Verifying zero cross-site overlap (smoke test outputs) ==="
-python3 check_overlap.py ./phase1_data_disjoint/
-python3 check_overlap.py ./phase2_data_disjoint/
+python3 simulation/check_overlap.py ./phase1_data_disjoint/
+python3 simulation/check_overlap.py ./phase2_data_disjoint/
 echo
 echo "If either check above reports any overlap, or if the console output"
 echo "above showed any [disjoint-sampling] shortfall/duplication warnings,"
@@ -70,8 +75,8 @@ done
 
 echo
 echo "=== Final overlap verification across the full grid ==="
-python3 check_overlap.py ./phase1_data_disjoint/
-python3 check_overlap.py ./phase2_data_disjoint/
+python3 simulation/check_overlap.py ./phase1_data_disjoint/
+python3 simulation/check_overlap.py ./phase2_data_disjoint/
 
 echo
 echo "Done. Site CSVs are in ./phase1_data_disjoint/ and ./phase2_data_disjoint/."

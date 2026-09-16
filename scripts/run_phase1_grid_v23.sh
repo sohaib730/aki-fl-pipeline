@@ -2,13 +2,18 @@
 
 set -e
 
+# Always run from the repository root, whatever directory this script is
+# invoked from -- data/results paths below are relative to the repo root and
+# the Python files live in simulation/ and training/.
+cd "$(dirname "$0")/.."
+
 ALPHAS=(0.1 0.3 0.5 1.0 10.0)
 GAMMAS=(0.0 0.5 0.75 1.0)
 SEEDS=(42 123 456)
 METHODS=(fedadaptproto fedavg fedprox scaffold fedadapt)
 
 DATA_DIR="./phase1_data_disjoint"
-TRAIN_SCRIPT="phase1_archetype_train_v23.py"
+TRAIN_SCRIPT="training/phase1_archetype_train_v23.py"
 
 # Optional tag: ./run_phase1_grid_v23.sh postfix  ->  output goes to
 # ./results_phase1_grid_v23_postfix/ instead of ./results_phase1_grid_v23/.

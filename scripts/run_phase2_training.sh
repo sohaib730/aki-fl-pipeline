@@ -20,6 +20,11 @@
 
 set -e
 
+# Always run from the repository root, whatever directory this script is
+# invoked from -- data/results paths below are relative to the repo root and
+# the Python files live in simulation/ and training/.
+cd "$(dirname "$0")/.."
+
 DATA_DIR="./phase2_data_disjoint"
 OUT_ROOT="./results_phase2_training"
 
@@ -60,7 +65,7 @@ for cond in "${CONDITIONS[@]}"; do
       continue
     fi
     echo "=== [Sec 3] v2.3 alpha=$ALPHA gamma=$GAMMA seed=$SEED ==="
-    python3 phase2_gpc_aligned_train_v23.py \
+    python3 training/phase2_gpc_aligned_train_v23.py \
       --data_dir "$DATA_DIR" --alpha "$ALPHA" --gamma "$GAMMA" --seed "$SEED" --local_epochs 3 \
       --method fedadaptproto --group_taxonomy phase4_20group --group_class_weighting \
       --discriminator_target group --n_clusters 2 \
@@ -81,7 +86,7 @@ for cond in "${CONDITIONS[@]}"; do
       continue
     fi
     echo "=== [Sec 4] v2.5 alpha=$ALPHA gamma=$GAMMA seed=$SEED ==="
-    python3 phase2_gpc_aligned_train_v25.py \
+    python3 training/phase2_gpc_aligned_train_v25.py \
       --data_dir "$DATA_DIR" --alpha "$ALPHA" --gamma "$GAMMA" --seed "$SEED" --local_epochs 1 \
       --method fedadaptproto --group_taxonomy phase4_20group --group_class_weighting \
       --discriminator_target group --auto_k --k_min 2 --k_max 5 \
@@ -104,7 +109,7 @@ for METHOD in fedavg fedprox scaffold fedadapt; do
         continue
       fi
       echo "=== [Sec 5] $METHOD alpha=$ALPHA gamma=$GAMMA seed=$SEED ==="
-      python3 phase2_gpc_aligned_train_v23.py \
+      python3 training/phase2_gpc_aligned_train_v23.py \
         --data_dir "$DATA_DIR" --alpha "$ALPHA" --gamma "$GAMMA" --seed "$SEED" --local_epochs 3 \
         --method "$METHOD" --group_taxonomy phase4_20group --group_class_weighting \
         --output_dir "$OUT_DIR"
