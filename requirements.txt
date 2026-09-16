@@ -1,0 +1,11 @@
+# Preprocessing notebooks (Google Colab + BigQuery)
+google-cloud-bigquery
+db-dtypes
+pandas
+numpy
+matplotlib
+seaborn
+
+# Simulation + training scripts
+torch
+scikit-learn

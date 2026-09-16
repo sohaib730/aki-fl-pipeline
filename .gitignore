@@ -1,0 +1,23 @@
+# MIMIC-IV-derived data — never commit (PhysioNet DUA)
+*.csv
+phase1_data_disjoint/
+phase2_data_disjoint/
+results*/
+*.pt
+*.pth
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+env/
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Notebooks / editors / OS
+.ipynb_checkpoints/
+.DS_Store
+.vscode/
+.idea/

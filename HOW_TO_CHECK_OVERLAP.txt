@@ -1,0 +1,88 @@
+HOW TO CONFIRM CROSS-SITE PATIENT OVERLAP
+==========================================
+
+NOTE: the patch described below is now already applied in the delivered
+`*_disjoint_sites.py` scripts, which also actively PREVENT overlap (not
+just detect it) -- this file is kept as a reference for what the patch
+does and why. check_overlap.py also now automatically groups files by
+(alpha, gamma) condition before checking -- disjointness only needs to
+hold WITHIN a single condition (each is an independent simulation run),
+so pointing it at a directory with many conditions' output no longer
+produces a false alarm.
+
+The simulation script has no overlap check despite a comment implying one
+exists ("sampled_real_index = site_df.index  # kept for the integrity
+check below" -- no such check is present anywhere in the file). To check
+for real, add the following two changes.
+
+------------------------------------------------------------------------
+STEP 1 -- patch the simulation script (both Phase 1 and Phase 2 versions)
+------------------------------------------------------------------------
+
+In mimic_ftl_simulation_phase1_archetype_post_leakage_FIXED.py (and the
+Phase 4 / GPC-aligned equivalent), find this block:
+
+    site_df = sample_with_prevalence_and_acuity(
+        df_source, label_col, target_prev, n=TARGET_N_PER_SITE,
+        acuity_bias=cfg["acuity_bias"], spread_scale=cfg["spread_scale"],
+        gamma=gamma, acuity_col="_acuity_z", rng=rng,
+    )
+    sampled_real_index = site_df.index  # kept for the integrity check below
+
+    # 4. Mask to site feature set + label (drop the helper acuity column)
+
+Insert ONE line directly after the existing `sampled_real_index = ...`
+line, BEFORE the "# 4. Mask to site feature set" comment, to capture
+subject_id before it gets dropped by the keep_cols masking below:
+
+    site_df = sample_with_prevalence_and_acuity(
+        df_source, label_col, target_prev, n=TARGET_N_PER_SITE,
+        acuity_bias=cfg["acuity_bias"], spread_scale=cfg["spread_scale"],
+        gamma=gamma, acuity_col="_acuity_z", rng=rng,
+    )
+    sampled_real_index = site_df.index  # kept for the integrity check below
+
+    # [OVERLAP CHECK] Save this site's sampled subject_ids before the
+    # keep_cols masking below drops the column. One file per site per
+    # condition, so a single sweep run produces everything needed.
+    site_df[['subject_id']].to_csv(
+        output_dir / f"_subject_ids_{site_id}_alpha{alpha}_gamma{gamma}.csv",
+        index=False
+    )
+
+    # 4. Mask to site feature set + label (drop the helper acuity column)
+
+Note: if subject_id is not a literal column name in your input CSV,
+substitute whatever the actual patient-identifier column is called (check
+`df.columns` right after the `pd.read_csv(args.input)` line in `main()`).
+
+------------------------------------------------------------------------
+STEP 2 -- run one condition (no need to run the full 20-condition grid,
+one alpha/gamma pair is enough to check whether overlap exists at all)
+------------------------------------------------------------------------
+
+    python3 mimic_ftl_simulation_phase1_archetype_post_leakage_FIXED.py \
+      --input aki_anchor_based_24h_lookback.csv \
+      --label AKI_label \
+      --alpha 0.3 --gamma 0.75 --seed 42 \
+      --output ./overlap_check/
+
+This produces, alongside the normal outputs:
+    overlap_check/_subject_ids_site_A_alpha0.3_gamma0.75.csv
+    overlap_check/_subject_ids_site_B_alpha0.3_gamma0.75.csv
+    overlap_check/_subject_ids_site_C_alpha0.3_gamma0.75.csv
+    overlap_check/_subject_ids_site_D_alpha0.3_gamma0.75.csv
+    overlap_check/_subject_ids_site_E_alpha0.3_gamma0.75.csv
+
+Same idea for Phase 2 (six _subject_ids_sim_*.csv files) using
+mimic_ftl_simulation_phase4_gpc_aligned_post_leakage.py.
+
+------------------------------------------------------------------------
+STEP 3 -- check overlap
+------------------------------------------------------------------------
+
+Run this after Step 2 completes:
+
+    python3 check_overlap.py ./overlap_check/
+
+------------------------------------------------------------------------
