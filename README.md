@@ -12,10 +12,6 @@ Everything lives at the repo root on purpose: the shell scripts call the
 Python files by bare name and expect the master CSVs in the working
 directory. Don't move files into subfolders without editing the scripts.
 
-The code here is the cleaned-up subset of
-[SanaAwan5/AKI-Prediction-MIMIC-IV](https://github.com/SanaAwan5/AKI-Prediction-MIMIC-IV)
-that the final pipeline actually uses — the superseded/dead-end script
-versions from that repo are intentionally left out.
 
 ---
 
@@ -42,14 +38,6 @@ notebooks in Stage 2 will run:
 
 The notebooks query BigQuery directly; nothing is downloaded from
 PhysioNet by hand.
-
-> **Data governance.** Every file derived from MIMIC-IV — the master CSVs,
-> the simulated per-site CSVs, the `_subject_ids_*.csv` files, training
-> outputs that contain patient rows — is covered by the DUA and must not
-> be committed or shared. `.gitignore` excludes `*.csv`, the data
-> directories, and result folders for this reason. The two notebooks are
-> shipped with **outputs cleared**; if you re-run them, clear outputs
-> again before committing (`jupyter nbconvert --clear-output --inplace *.ipynb`).
 
 ---
 
