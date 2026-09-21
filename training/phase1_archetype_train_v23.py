@@ -4,7 +4,7 @@ fedadapt_train.py
 Unified training loop for federated AKI prediction experiments.
 
 Supports four methods via --method flag:
-    fedadapt  — proposed: input adapter + shared body + GRL + personal head
+    fedadapt  — proposed: Coming Soon
     fedavg    — FedAvg baseline: adapter + shared body + shared head (no GRL)
     fedprox   — FedProx baseline: fedavg + proximal penalty on body weights
     scaffold  — SCAFFOLD baseline: fedavg + control variates for client drift
@@ -32,10 +32,10 @@ results/<method>/
 USAGE
 -----
 # FedAdapt (proposed)
-python fedadapt_train.py --data_dir ./phase2_sites/ --method fedadapt
+python fedadapt_train.py --data_dir ./phase2_sites/ --method fedadapt --Coming Soon
 
 # All baselines in one go (run sequentially)
-for METHOD in fedavg fedprox scaffold fedadapt; do
+for METHOD in fedavg fedprox scaffold; do
     python fedadapt_train.py --data_dir ./phase2_sites/ --method $METHOD
 done
 
@@ -79,16 +79,7 @@ warnings.filterwarnings("ignore")
 
 # ── import model components ───────────────────────────────────────────────────
 # Assumes fedadapt_model.py is in the same directory or on PYTHONPATH
-sys.path.insert(0, str(Path(__file__).parent))
-from fedadapt_model_approach2 import (
-    FedAdaptClient,
-    FedAdaptServer,
-    SharedBody,
-    fedadapt_loss,
-    fedprox_penalty,
-    compute_local_prototypes,
-    prototype_alignment_loss,
-)
+
 
 # ─── FEATURE GROUP DEFINITIONS (must match simulation) ────────────────────────
 
@@ -650,36 +641,7 @@ def prototype_alignment_loss_multicluster(
 
 # ─── LOCAL TRAINING STEPS ─────────────────────────────────────────────────────
 
-def local_step_fedadapt(
-    client:     FedAdaptClient,
-    loader:     DataLoader,
-    optimizer:  torch.optim.Optimizer,
-    lambda_adv: float,
-    pos_weight: Optional[Tensor],
-) -> Dict[str, float]:
-    """One epoch of FedAdapt local training (task + GRL adversarial)."""
-    client.train()
-    totals = {"total": 0.0, "task": 0.0, "adv": 0.0}
-    n = 0
 
-    for x, y, g in loader:
-        optimizer.zero_grad()
-        task_logit, group_logits = client(x)
-        total, task, adv, _ = fedadapt_loss(
-            task_logit, y, group_logits, g,
-            lambda_adv=lambda_adv, pos_weight=pos_weight,
-        )
-        total.backward()
-        nn.utils.clip_grad_norm_(client.parameters(), max_norm=1.0)
-        optimizer.step()
-
-        b = len(y)
-        totals["total"] += total.item() * b
-        totals["task"]  += task.item()  * b
-        totals["adv"]   += adv.item()   * b
-        n += b
-
-    return {k: v / max(n, 1) for k, v in totals.items()}
 
 
 def local_step_fedadaptproto(
@@ -1316,69 +1278,7 @@ def run_federation(
         # every client aligns toward prototypes that reflect the *start* of
         # this round's shared representation, not a stale previous-round one
         # and not a moving target updated mid-round.
-        if method == "fedadaptproto":
-            client_protos:  List[dict] = []
-            client_n_pos:   List[int]  = []
-            client_n_neg:   List[int]  = []
-            for sid, client in clients.items():
-                sd = sites[sid]
-                client.eval()
-                with torch.no_grad():
-                    xs, ys = [], []
-                    for x, y, _ in sd.train_loader:
-                        xs.append(x)
-                        ys.append(y)
-                    x_all = torch.cat(xs, dim=0)
-                    y_all = torch.cat(ys, dim=0)
-                    emb_all = client.encode(x_all)
-                # v2.3: per-site K. If --n_clusters_per_site override is given,
-                # use it; otherwise fall back to the global --n_clusters value
-                # so v2.2 behavior is preserved when no override is passed.
-                k_site = per_site_k.get(sid, args.n_clusters)
-                # Site-specific RNG seed: previously this was
-                # args.seed + rnd only, identical across ALL sites within a
-                # round, meaning every site's k-means++ initialization drew
-                # the same relative random sequence — not truly independent
-                # per-site randomness, even though it was still fully
-                # deterministic run-to-run. site_idx (stable positional index
-                # in the clients dict, since Python dicts preserve insertion
-                # order) gives each site its own distinct, reproducible seed.
-                site_idx = list(clients.keys()).index(sid)
-                protos, n_pos, n_neg = (
-                    compute_local_prototypes_multicluster(
-                        emb_all, y_all,
-                        n_clusters=k_site,
-                        rng=np.random.default_rng(args.seed + rnd * 1000 + site_idx),
-                    )
-                    if k_site > 1
-                    else compute_local_prototypes(emb_all, y_all)
-                )
-                client_protos.append(protos)
-                client_n_pos.append(n_pos)
-                client_n_neg.append(n_neg)
-
-            # client_n_pos / client_n_neg feed server-side aggregation weights
-            # (sqrt(n)-weighted, see FedAdaptServer.aggregate_prototypes) —
-            # NOT used for per-client loss reweighting; that reliability-
-            # weighted variant (v2) was tried and reverted, see
-            # local_step_fedadaptproto docstring.
-            # Global aggregation K = max of per-site Ks (so a site with K=2
-            # contributes 2 centers into a 3-cluster global pool when other
-            # sites use K=3). This is the cleanest pooling behavior: every
-            # site's centers are still represented, but a uni-modal site
-            # doesn't fabricate noise clusters into the shared space.
-            k_global = max(per_site_k.values()) if per_site_k else args.n_clusters
-            if k_global > 1:
-                global_protos = aggregate_prototypes_multicluster(
-                    client_protos, client_n_pos, client_n_neg,
-                    n_clusters=k_global,
-                    rng=np.random.default_rng(args.seed + rnd + 9999),
-                )
-            else:
-                global_protos = server.aggregate_prototypes(
-                    client_protos, client_n_pos, client_n_neg
-                )
-
+        
         # ── local training ─────────────────────────────────────────────────
         round_losses: Dict[str, dict] = {}
         for sid, client in clients.items():
@@ -1398,22 +1298,8 @@ def run_federation(
             epochs_no_improve = 0
 
             for local_ep in range(args.local_epochs):
-                if method == "fedadapt":
-                    losses = local_step_fedadapt(
-                        client, sd.train_loader, opt,
-                        lambda_adv=eff_lambda_adv,
-                        pos_weight=sd.pos_weight,
-                    )
-                elif method == "fedadaptproto":
-                    losses = local_step_fedadaptproto(
-                        client, sd.train_loader, opt,
-                        lambda_adv=eff_lambda_adv,
-                        pos_weight=sd.pos_weight,
-                        global_protos=global_protos,
-                        alpha_proto=eff_alpha_proto,
-                        multicluster=(max(per_site_k.values()) > 1 if per_site_k else args.n_clusters > 1),
-                    )
-                elif method == "fedprox":
+                
+                if method == "fedprox":
                     losses = local_step_fedprox(
                         client, sd.train_loader, opt,
                         pos_weight=sd.pos_weight,
@@ -1539,11 +1425,7 @@ def run_federation(
         print(f"    {sid}: best round={ckpt_best_round[sid]}  best_auroc={ckpt_best_auroc[sid]:.4f}{marker}")
 
     # ── head fine-tuning (FedAdapt and FedAdapt-Proto only) ────────────────
-    if method in ("fedadapt", "fedadaptproto"):
-        finetune_heads(clients, sites, args.finetune_epochs,
-                       args.lr * args.ft_lr_mult,
-                       use_pos_weight=args.ft_pos_weight,
-                       grad_clip=args.ft_grad_clip)
+   
 
     # ── final evaluation ───────────────────────────────────────────────────
     final_rows = []
@@ -1584,8 +1466,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fl_gain_csv",    default=None,   help="Path to fl_gain_index_*.csv")
 
     # Method
-    p.add_argument("--method",         default="fedadapt",
-                   choices=["fedadapt", "fedadaptproto", "fedavg", "fedprox", "scaffold"])
+    p.add_argument("--method",         default="fedavg",
+                   choices=[ "fedavg", "fedprox", "scaffold"])
 
     # Federation
     p.add_argument("--rounds",         type=int,   default=50)
