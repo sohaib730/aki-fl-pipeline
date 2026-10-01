@@ -6,7 +6,7 @@ MIMIC-IV. The pipeline has four stages, run in order:
 1. **Get MIMIC-IV access** (credentialed PhysioNet + Google BigQuery)
 2. **Preprocess** — two Colab notebooks build the Phase 1 and Phase 2 master cohorts
 3. **Simulate disjoint sites** — split each cohort into non-overlapping synthetic hospitals
-4. **Train** — one bash script per phase runs the full federated training grid
+4. **Train** — one bash script per phase runs the full federated training grid (Code will be uploaded soon after manuscript submission)
 
 Everything lives at the repo root on purpose: the shell scripts call the
 Python files by bare name and expect the master CSVs in the working
@@ -102,10 +102,7 @@ counterpart in GPC production tables (heart rate, respiratory rate,
 temperature, SpO2, GCS) — this is baked into the training scripts, not a
 step you run.
 
-Short version: Phase 1 asks "does federated learning help across
-*stylised* hospital types?"; Phase 2 asks "does it help across sites that
-look like a *specific real* network?" — same patients, different feature
-views.
+Short version: same patients, different feature views.
 
 ---
 
@@ -227,7 +224,7 @@ what the resume-skip check looks for.
 - `check_overlap.py`, `HOW_TO_CHECK_OVERLAP.txt`
 
 **Training (Stage 4)**
-
+The code will be uploaded soon after manuscript submission
 - `phase1_archetype_train_v23.py`, `phase1_archetype_train_v25.py`
 - `phase2_gpc_aligned_train_v23.py`, `phase2_gpc_aligned_train_v25.py`
 - `fedadapt_model_approach2.py` — shared model definitions
